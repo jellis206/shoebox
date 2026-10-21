@@ -85,8 +85,14 @@ pub fn uuid_from_error_str(error: &str) -> Option<String> {
 }
 
 fn stem_and_ext(path: &Path) -> (String, String) {
-    let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-    let ext = path.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let ext = path
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
     (stem, ext)
 }
 
@@ -97,7 +103,9 @@ pub struct Photos {
 impl Photos {
     /// Compiles the AppleScript. Photos is launched on demand by the first call that needs it.
     pub fn new() -> Result<Self> {
-        Ok(Photos { script: osa::Script::compile(SCRIPT)? })
+        Ok(Photos {
+            script: osa::Script::compile(SCRIPT)?,
+        })
     }
 
     /// Runs a handler; on an AppleEvent timeout kills Photos and retries once.
@@ -111,7 +119,10 @@ impl Photos {
             }
             r => r,
         }
-        .map_err(|e| Error { message: format!("{handler}: {}", e.message), number: e.number })
+        .map_err(|e| Error {
+            message: format!("{handler}: {}", e.message),
+            number: e.number,
+        })
     }
 
     pub fn activate(&self) -> Result<()> {
@@ -129,13 +140,21 @@ impl Photos {
     /// Quits Photos and reopens it on `library_path`, waiting `delay` seconds for the user to acknowledge.
     pub fn open(&self, library_path: &Path, delay: i64) -> Result<()> {
         if !library_path.is_dir() {
-            return Err(Error::new(format!("{} does not appear to be a Photos library", library_path.display())));
+            return Err(Error::new(format!(
+                "{} does not appear to be a Photos library",
+                library_path.display()
+            )));
         }
         self.activate()?;
         let path = library_path.to_string_lossy().into_owned();
-        let tries = osa::Script::compile(OPEN_SCRIPT)?.call("openLibrary", &[path.into(), delay.into()])?.as_i64()?;
+        let tries = osa::Script::compile(OPEN_SCRIPT)?
+            .call("openLibrary", &[path.into(), delay.into()])?
+            .as_i64()?;
         if tries != 99 {
-            return Err(Error::new(format!("Photos failed to open {} after {tries} tries", library_path.display())));
+            return Err(Error::new(format!(
+                "Photos failed to open {} after {tries} tries",
+                library_path.display()
+            )));
         }
         Ok(())
     }
@@ -167,7 +186,11 @@ impl Photos {
 
     pub fn selection(&self) -> Result<Vec<Photo<'_>>> {
         match self.run("photosLibraryGetSelection", &[]) {
-            Ok(ids) => ids.into_text_list()?.iter().map(|id| self.photo(id)).collect(),
+            Ok(ids) => ids
+                .into_text_list()?
+                .iter()
+                .map(|id| self.photo(id))
+                .collect(),
             // In full-screen view Photos errors but names the photo in the message.
             Err(e) => match uuid_from_error_str(&e.message) {
                 Some(uuid) => Ok(self.photo(&uuid).into_iter().collect()),
@@ -185,49 +208,76 @@ impl Photos {
         Photo::new(self, uuid)
     }
 
-    /// Every photo in the library, fetched lazily one at a time (Photos manages ~1/sec).
+    /// Every photo id in library order. One bulk Apple event: ~1s for 13k photos,
+    /// where indexed lookups (`media items 1 thru n`) take ~0.1s per photo.
+    pub fn all_photo_ids(&self) -> Result<Vec<String>> {
+        self.run("photosLibraryGetAllPhotos", &[])?.into_text_list()
+    }
+
+    /// Every photo in the library; ids are fetched up front, photos validated lazily.
     pub fn all_photos(&self) -> Result<impl Iterator<Item = Result<Photo<'_>>>> {
-        let count = self.count()?;
-        Ok((1..=count).map(move |n| {
-            let ids = self.run("photosLibraryGetPhotoByRange", &[n.into(), n.into()])?.into_text_list()?;
-            let id = ids.first().ok_or_else(|| Error::new(format!("no photo at index {n}")))?;
-            self.photo(id)
-        }))
+        Ok(self
+            .all_photo_ids()?
+            .into_iter()
+            .map(move |id| self.photo(&id)))
     }
 
     /// Photo ids matching a Photos search string.
     pub fn search(&self, text: &str) -> Result<Vec<String>> {
-        self.run("photosLibrarySearchPhotos", &[text.into()])?.into_text_list()
+        self.run("photosLibrarySearchPhotos", &[text.into()])?
+            .into_text_list()
     }
 
     /// Photo ids for library positions `[start, stop)`.
     pub fn photo_ids_in_range(&self, start: i64, stop: i64) -> Result<Vec<String>> {
-        let (first, last) = range_bounds(start, stop, self.count()?)?;
-        self.run("photosLibraryGetPhotoByRange", &[first.into(), last.into()])?.into_text_list()
+        let mut ids = self.all_photo_ids()?;
+        let (first, last) = range_bounds(start, stop, ids.len() as i64)?;
+        ids.truncate(last as usize);
+        Ok(ids.split_off(first as usize - 1))
     }
 
     /// Imports files, optionally straight into `album`.
     ///
     /// Without `skip_duplicate_check`, importing a duplicate blocks on a Photos dialog.
-    pub fn import(&self, paths: &[PathBuf], album: Option<&Album>, skip_duplicate_check: bool) -> Result<Vec<Photo<'_>>> {
+    pub fn import(
+        &self,
+        paths: &[PathBuf],
+        album: Option<&Album>,
+        skip_duplicate_check: bool,
+    ) -> Result<Vec<Photo<'_>>> {
         let paths: Vec<Value> = paths
             .iter()
             .map(|p| fs::canonicalize(p).map(|p| Value::from(p.to_string_lossy().into_owned())))
             .collect::<std::io::Result<_>>()
             .map_err(|e| Error::new(format!("import: {e}")))?;
         let ids = match album {
-            Some(album) => self.run("photosLibraryImportToAlbum", &[Value::List(paths), album.id.clone().into(), skip_duplicate_check.into()])?,
-            None => self.run("photosLibraryImport", &[Value::List(paths), skip_duplicate_check.into()])?,
+            Some(album) => self.run(
+                "photosLibraryImportToAlbum",
+                &[
+                    Value::List(paths),
+                    album.id.clone().into(),
+                    skip_duplicate_check.into(),
+                ],
+            )?,
+            None => self.run(
+                "photosLibraryImport",
+                &[Value::List(paths), skip_duplicate_check.into()],
+            )?,
         };
-        ids.into_text_list()?.iter().map(|id| self.photo(id)).collect()
+        ids.into_text_list()?
+            .iter()
+            .map(|id| self.photo(id))
+            .collect()
     }
 
     pub fn album_names(&self, top_level: bool) -> Result<Vec<String>> {
-        self.run("photosLibraryAlbumNames", &[top_level.into()])?.into_text_list()
+        self.run("photosLibraryAlbumNames", &[top_level.into()])?
+            .into_text_list()
     }
 
     pub fn folder_names(&self, top_level: bool) -> Result<Vec<String>> {
-        self.run("photosLibraryFolderNames", &[top_level.into()])?.into_text_list()
+        self.run("photosLibraryFolderNames", &[top_level.into()])?
+            .into_text_list()
     }
 
     pub fn album(&self, uuid: &str) -> Result<Album<'_>> {
@@ -243,13 +293,18 @@ impl Photos {
     }
 
     pub fn albums(&self, top_level: bool) -> Result<Vec<Album<'_>>> {
-        let ids = self.run("photosLibraryAlbumIDs", &[top_level.into()])?.into_text_list()?;
+        let ids = self
+            .run("photosLibraryAlbumIDs", &[top_level.into()])?
+            .into_text_list()?;
         ids.iter().map(|id| self.album(id)).collect()
     }
 
     pub fn create_album(&self, name: &str, folder: Option<&Folder>) -> Result<Album<'_>> {
         let id = match folder {
-            Some(f) => self.run("photosLibraryCreateAlbumAtFolder", &[name.into(), f.idstring.clone().into()])?,
+            Some(f) => self.run(
+                "photosLibraryCreateAlbumAtFolder",
+                &[name.into(), f.idstring.clone().into()],
+            )?,
             None => self.run("photosLibraryCreateAlbum", &[name.into()])?,
         };
         match id.into_opt_text()? {
@@ -260,7 +315,8 @@ impl Photos {
 
     /// Deletes the album but not its photos.
     pub fn delete_album(&self, album: &Album) -> Result<()> {
-        self.run("photosLibraryDeleteAlbum", &[album.id.clone().into()]).map(drop)
+        self.run("photosLibraryDeleteAlbum", &[album.id.clone().into()])
+            .map(drop)
     }
 
     fn folder_from_idstring(&self, idstring: Value) -> Result<Option<Folder<'_>>> {
@@ -271,7 +327,10 @@ impl Photos {
     }
 
     pub fn folder_by_name(&self, name: &str, top_level: bool) -> Result<Option<Folder<'_>>> {
-        self.folder_from_idstring(self.run("photosLibraryGetFolderIDStringForName", &[name.into(), top_level.into()])?)
+        self.folder_from_idstring(self.run(
+            "photosLibraryGetFolderIDStringForName",
+            &[name.into(), top_level.into()],
+        )?)
     }
 
     /// Folder at `path`, e.g. `["Folder", "SubFolder"]`.
@@ -281,19 +340,30 @@ impl Photos {
 
     pub fn folder_by_uuid(&self, uuid: &str) -> Result<Option<Folder<'_>>> {
         let (_, id) = uuid_to_id(uuid, SUFFIX_FOLDER);
-        self.folder_from_idstring(self.run("photosLibraryGetFolderIDStringForID", &[id.into(), false.into()])?)
+        self.folder_from_idstring(self.run(
+            "photosLibraryGetFolderIDStringForID",
+            &[id.into(), false.into()],
+        )?)
     }
 
     pub fn folders(&self, top_level: bool) -> Result<Vec<Folder<'_>>> {
-        let ids = self.run("photosLibraryFolderIDs", &[top_level.into()])?.into_text_list()?;
+        let ids = self
+            .run("photosLibraryFolderIDs", &[top_level.into()])?
+            .into_text_list()?;
         ids.iter()
-            .map(|id| self.folder_by_uuid(id)?.ok_or_else(|| Error::new(format!("folder {id} vanished"))))
+            .map(|id| {
+                self.folder_by_uuid(id)?
+                    .ok_or_else(|| Error::new(format!("folder {id} vanished")))
+            })
             .collect()
     }
 
     pub fn create_folder(&self, name: &str, parent: Option<&Folder>) -> Result<Folder<'_>> {
         let idstring = match parent {
-            Some(p) => self.run("photosLibraryCreateFolderAtFolder", &[name.into(), p.idstring.clone().into()])?,
+            Some(p) => self.run(
+                "photosLibraryCreateFolderAtFolder",
+                &[name.into(), p.idstring.clone().into()],
+            )?,
             None => self.run("photosLibraryCreateFolder", &[name.into()])?,
         };
         self.folder_from_idstring(idstring)?
@@ -302,7 +372,9 @@ impl Photos {
 
     /// Like `mkdir -p`: creates any missing folders along `path` and returns the last.
     pub fn make_folders(&self, path: &[String]) -> Result<Folder<'_>> {
-        let (first, rest) = path.split_first().ok_or_else(|| Error::new("no values in folder path"))?;
+        let (first, rest) = path
+            .split_first()
+            .ok_or_else(|| Error::new("no values in folder path"))?;
         let mut folder = match self.folder_by_name(first, true)? {
             Some(f) => f,
             None => self.create_folder(first, None)?,
@@ -330,12 +402,19 @@ impl Photos {
 
     /// Deletes a folder and everything in it. Photos only supports this for top-level folders.
     pub fn delete_folder(&self, folder: &Folder) -> Result<()> {
-        self.run("photosLibraryDeleteFolder", &[folder.idstring.clone().into()]).map(drop)
+        self.run(
+            "photosLibraryDeleteFolder",
+            &[folder.idstring.clone().into()],
+        )
+        .map(drop)
     }
 
     fn temp_album_name(&self) -> Result<String> {
         loop {
-            let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
             let name = format!("shoebox_{nanos}");
             if self.album_by_name(&name, false)?.is_none() {
                 return Ok(name);
@@ -344,53 +423,101 @@ impl Photos {
     }
 
     pub fn reveal_in_finder(&self, paths: &[PathBuf]) -> Result<()> {
-        let paths: Vec<String> = paths.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        let paths: Vec<String> = paths
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
         self.run("revealInFinder", &[paths.into()]).map(drop)
     }
 
-    fn export_photo(&self, photo: &Photo, dest: &Path, opts: &ExportOptions) -> Result<Vec<PathBuf>> {
+    fn export_photo(
+        &self,
+        photo: &Photo,
+        dest: &Path,
+        opts: &ExportOptions,
+    ) -> Result<Vec<PathBuf>> {
         if !dest.is_dir() {
-            return Err(Error::new(format!("export path {} must be a directory", dest.display())));
+            return Err(Error::new(format!(
+                "export path {} must be a directory",
+                dest.display()
+            )));
         }
         let io = |e: std::io::Error| Error::new(format!("export: {e}"));
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
         let tmp = std::env::temp_dir().join(format!("shoebox_{}_{nanos}", std::process::id()));
         fs::create_dir_all(&tmp).map_err(io)?;
         let result = (|| {
             let tmp_str = tmp.to_string_lossy().into_owned();
-            let args = [photo.id.clone().into(), tmp_str.into(), opts.original.into(), (!opts.original).into(), opts.timeout.into()];
+            let args = [
+                photo.id.clone().into(),
+                tmp_str.into(),
+                opts.original.into(),
+                (!opts.original).into(),
+                opts.timeout.into(),
+            ];
             self.run("photoExport", &args)?;
 
             // Photos may rename on export (JPG -> jpeg) and live photos export two files,
             // so take whatever landed; files sharing a stem share the de-duplicated name.
             let mut exported = vec![];
             let mut seen: HashMap<String, String> = HashMap::new();
-            for entry in fs::read_dir(&tmp).map_err(io)? {
+            for (n, entry) in fs::read_dir(&tmp).map_err(io)?.enumerate() {
                 let src = entry.map_err(io)?.path();
                 let (stem, ext) = stem_and_ext(&src);
-                let new_stem = if opts.overwrite {
-                    stem.clone()
-                } else {
-                    seen.entry(stem.clone())
-                        .or_insert_with(|| {
-                            let prefix = stem.to_lowercase();
-                            let existing: Vec<String> = fs::read_dir(dest)
-                                .into_iter()
-                                .flatten()
-                                .flatten()
-                                .map(|e| stem_and_ext(&e.path()).0)
-                                .filter(|s| s.to_lowercase().starts_with(&prefix))
-                                .collect();
-                            unique_stem(&stem, &existing)
-                        })
-                        .clone()
-                };
-                let target = dest.join(format!("{new_stem}{ext}"));
-                // ditto keeps extended attributes and resource forks
-                let ok = Command::new("/usr/bin/ditto").arg(&src).arg(&target).status().map_err(io)?.success();
+                // ditto keeps extended attributes and resource forks; copy to a private
+                // name in dest first so the final name can be claimed atomically below.
+                let staged = dest.join(format!(".shoebox-{}-{nanos}-{n}{ext}", std::process::id()));
+                let ok = Command::new("/usr/bin/ditto")
+                    .arg(&src)
+                    .arg(&staged)
+                    .status()
+                    .map_err(io)?
+                    .success();
                 if !ok {
-                    return Err(Error::new(format!("ditto failed copying to {}", target.display())));
+                    let _ = fs::remove_file(&staged);
+                    return Err(Error::new(format!(
+                        "ditto failed copying to {}",
+                        staged.display()
+                    )));
                 }
+                if opts.overwrite {
+                    let target = dest.join(format!("{stem}{ext}"));
+                    fs::rename(&staged, &target).map_err(io)?;
+                    exported.push(target);
+                    continue;
+                }
+                // Several shoebox processes may export into dest at once, so a name is only
+                // ours once hard_link (which fails if it exists) succeeds.
+                let mut taken: Vec<String> = fs::read_dir(dest)
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .map(|e| stem_and_ext(&e.path()).0)
+                    .filter(|s| s.to_lowercase().starts_with(&stem.to_lowercase()))
+                    .collect();
+                let mut new_stem = seen
+                    .get(&stem)
+                    .cloned()
+                    .unwrap_or_else(|| unique_stem(&stem, &taken));
+                let target = loop {
+                    let target = dest.join(format!("{new_stem}{ext}"));
+                    match fs::hard_link(&staged, &target) {
+                        Ok(()) => break target,
+                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                            taken.push(new_stem);
+                            new_stem = unique_stem(&stem, &taken);
+                        }
+                        Err(e) => {
+                            let _ = fs::remove_file(&staged);
+                            return Err(io(e));
+                        }
+                    }
+                };
+                fs::remove_file(&staged).map_err(io)?;
+                seen.insert(stem, new_stem);
                 exported.push(target);
             }
             Ok(exported)
@@ -417,7 +544,12 @@ pub struct ExportOptions {
 
 impl Default for ExportOptions {
     fn default() -> Self {
-        ExportOptions { original: false, overwrite: false, timeout: 120, reveal_in_finder: false }
+        ExportOptions {
+            original: false,
+            overwrite: false,
+            timeout: 120,
+            reveal_in_finder: false,
+        }
     }
 }
 
@@ -445,7 +577,9 @@ impl<'a> Album<'a> {
     }
 
     pub fn set_name(&self, name: &str) -> Result<()> {
-        self.lib.run("albumSetName", &[self.arg(), name.into()]).map(drop)
+        self.lib
+            .run("albumSetName", &[self.arg(), name.into()])
+            .map(drop)
     }
 
     /// Containing folder, or None for a top-level album.
@@ -465,7 +599,9 @@ impl<'a> Album<'a> {
 
     /// Library path, e.g. "Folder/SubFolder/Album".
     pub fn path_str(&self, delim: char) -> Result<String> {
-        self.lib.run("albumGetPath", &[self.arg(), delim.to_string().into()])?.into_text()
+        self.lib
+            .run("albumGetPath", &[self.arg(), delim.to_string().into()])?
+            .into_text()
     }
 
     pub fn photo_ids(&self) -> Result<Vec<String>> {
@@ -473,7 +609,10 @@ impl<'a> Album<'a> {
     }
 
     pub fn photos(&self) -> Result<Vec<Photo<'a>>> {
-        self.photo_ids()?.iter().map(|id| self.lib.photo(id)).collect()
+        self.photo_ids()?
+            .iter()
+            .map(|id| self.lib.photo(id))
+            .collect()
     }
 
     pub fn count(&self) -> Result<i64> {
@@ -483,7 +622,10 @@ impl<'a> Album<'a> {
     /// Adds library photos to the album; returns the photos added.
     pub fn add(&self, photos: &[Photo]) -> Result<Vec<Photo<'a>>> {
         let ids: Vec<String> = photos.iter().map(|p| p.id.clone()).collect();
-        let added = self.lib.run("albumAdd", &[self.arg(), ids.into()])?.into_text_list()?;
+        let added = self
+            .lib
+            .run("albumAdd", &[self.arg(), ids.into()])?
+            .into_text_list()?;
         added.iter().map(|id| self.lib.photo(id)).collect()
     }
 
@@ -492,7 +634,10 @@ impl<'a> Album<'a> {
     }
 
     pub fn export(&self, dest: &Path, opts: &ExportOptions) -> Result<Vec<PathBuf>> {
-        let per_photo = ExportOptions { reveal_in_finder: false, ..opts.clone() };
+        let per_photo = ExportOptions {
+            reveal_in_finder: false,
+            ..opts.clone()
+        };
         let mut exported = vec![];
         for photo in self.photos()? {
             exported.extend(photo.export(dest, &per_photo)?);
@@ -507,7 +652,9 @@ impl<'a> Album<'a> {
     /// builds a same-named replacement album without them and deletes this one.
     pub fn remove_by_id(&mut self, photo_ids: &[String]) -> Result<()> {
         let parent = self.parent()?;
-        let new = self.lib.create_album(&self.lib.temp_album_name()?, parent.as_ref())?;
+        let new = self
+            .lib
+            .create_album(&self.lib.temp_album_name()?, parent.as_ref())?;
         let keep: Vec<Photo> = self
             .photos()?
             .into_iter()
@@ -534,7 +681,9 @@ impl<'a> Album<'a> {
         if current == target {
             return Ok(());
         }
-        let new = self.lib.create_album(&self.lib.temp_album_name()?, folder)?;
+        let new = self
+            .lib
+            .create_album(&self.lib.temp_album_name()?, folder)?;
         new.add(&self.photos()?)?;
         self.replace_with(new)
     }
@@ -560,7 +709,10 @@ pub struct Folder<'a> {
 
 impl<'a> Folder<'a> {
     fn new(lib: &'a Photos, idstring: String) -> Result<Self> {
-        if !lib.run("folderExists", &[idstring.clone().into()])?.as_bool()? {
+        if !lib
+            .run("folderExists", &[idstring.clone().into()])?
+            .as_bool()?
+        {
             return Err(Error::new(format!("Folder {idstring} does not exist")));
         }
         Ok(Folder { lib, idstring })
@@ -572,12 +724,20 @@ impl<'a> Folder<'a> {
 
     /// Bare uuid (no `/L0/020` suffix).
     pub fn uuid(&self) -> Result<String> {
-        Ok(uuid_to_id(&self.lib.run("folderUUID", &[self.arg()])?.into_text()?, SUFFIX_FOLDER).0)
+        Ok(uuid_to_id(
+            &self.lib.run("folderUUID", &[self.arg()])?.into_text()?,
+            SUFFIX_FOLDER,
+        )
+        .0)
     }
 
     /// Suffixed AppleScript id.
     pub fn id(&self) -> Result<String> {
-        Ok(uuid_to_id(&self.lib.run("folderUUID", &[self.arg()])?.into_text()?, SUFFIX_FOLDER).1)
+        Ok(uuid_to_id(
+            &self.lib.run("folderUUID", &[self.arg()])?.into_text()?,
+            SUFFIX_FOLDER,
+        )
+        .1)
     }
 
     pub fn name(&self) -> Result<String> {
@@ -585,26 +745,37 @@ impl<'a> Folder<'a> {
     }
 
     pub fn set_name(&self, name: &str) -> Result<()> {
-        self.lib.run("folderSetName", &[self.arg(), name.into()]).map(drop)
+        self.lib
+            .run("folderSetName", &[self.arg(), name.into()])
+            .map(drop)
     }
 
     pub fn parent(&self) -> Result<Option<Folder<'a>>> {
-        self.lib.folder_from_idstring(self.lib.run("folderParent", &[self.arg()])?)
+        self.lib
+            .folder_from_idstring(self.lib.run("folderParent", &[self.arg()])?)
     }
 
     /// Library path, e.g. "Folder/SubFolder".
     pub fn path_str(&self, delim: char) -> Result<String> {
-        self.lib.run("folderGetPath", &[self.arg(), delim.to_string().into()])?.into_text()
+        self.lib
+            .run("folderGetPath", &[self.arg(), delim.to_string().into()])?
+            .into_text()
     }
 
     /// Ancestor folders, top-level first.
     pub fn path(&self) -> Result<Vec<Folder<'a>>> {
-        let ids = self.lib.run("folderGetPathFolderIDScript", &[self.arg()])?.into_text_list()?;
+        let ids = self
+            .lib
+            .run("folderGetPathFolderIDScript", &[self.arg()])?
+            .into_text_list()?;
         ids.into_iter().map(|s| Folder::new(self.lib, s)).collect()
     }
 
     pub fn albums(&self) -> Result<Vec<Album<'a>>> {
-        let ids = self.lib.run("folderAlbums", &[self.arg()])?.into_text_list()?;
+        let ids = self
+            .lib
+            .run("folderAlbums", &[self.arg()])?
+            .into_text_list()?;
         ids.iter().map(|id| self.lib.album(id)).collect()
     }
 
@@ -618,7 +789,10 @@ impl<'a> Folder<'a> {
     }
 
     pub fn subfolders(&self) -> Result<Vec<Folder<'a>>> {
-        let ids = self.lib.run("folderFolders", &[self.arg()])?.into_text_list()?;
+        let ids = self
+            .lib
+            .run("folderFolders", &[self.arg()])?
+            .into_text_list()?;
         ids.into_iter().map(|s| Folder::new(self.lib, s)).collect()
     }
 
@@ -674,7 +848,9 @@ impl<'a> Photo<'a> {
     }
 
     pub fn set_title(&self, title: &str) -> Result<()> {
-        self.lib.run("photoSetName", &[self.arg(), title.into()]).map(drop)
+        self.lib
+            .run("photoSetName", &[self.arg(), title.into()])
+            .map(drop)
     }
 
     pub fn description(&self) -> Result<String> {
@@ -682,15 +858,21 @@ impl<'a> Photo<'a> {
     }
 
     pub fn set_description(&self, description: &str) -> Result<()> {
-        self.lib.run("photoSetDescription", &[self.arg(), description.into()]).map(drop)
+        self.lib
+            .run("photoSetDescription", &[self.arg(), description.into()])
+            .map(drop)
     }
 
     pub fn keywords(&self) -> Result<Vec<String>> {
-        self.lib.run("photoKeywords", &[self.arg()])?.into_text_list()
+        self.lib
+            .run("photoKeywords", &[self.arg()])?
+            .into_text_list()
     }
 
     pub fn set_keywords(&self, keywords: &[String]) -> Result<()> {
-        self.lib.run("photoSetKeywords", &[self.arg(), keywords.to_vec().into()]).map(drop)
+        self.lib
+            .run("photoSetKeywords", &[self.arg(), keywords.to_vec().into()])
+            .map(drop)
     }
 
     pub fn favorite(&self) -> Result<bool> {
@@ -698,7 +880,9 @@ impl<'a> Photo<'a> {
     }
 
     pub fn set_favorite(&self, favorite: bool) -> Result<()> {
-        self.lib.run("photoSetFavorite", &[self.arg(), favorite.into()]).map(drop)
+        self.lib
+            .run("photoSetFavorite", &[self.arg(), favorite.into()])
+            .map(drop)
     }
 
     pub fn height(&self) -> Result<i64> {
@@ -731,7 +915,12 @@ impl<'a> Photo<'a> {
             return Err(Error::new("longitude must be in range -180.0 to 180.0"));
         }
         let v = |x: Option<f64>| x.map_or(Value::Missing, Value::Float);
-        self.lib.run("photoSetLocation", &[self.arg(), Value::List(vec![v(latitude), v(longitude)])]).map(drop)
+        self.lib
+            .run(
+                "photoSetLocation",
+                &[self.arg(), Value::List(vec![v(latitude), v(longitude)])],
+            )
+            .map(drop)
     }
 
     /// Capture date, timezone-naive local time.
@@ -744,7 +933,9 @@ impl<'a> Photo<'a> {
     }
 
     pub fn set_date(&self, date: NaiveDateTime) -> Result<()> {
-        self.lib.run("photoSetDate", &[self.arg(), Value::Date(date)]).map(drop)
+        self.lib
+            .run("photoSetDate", &[self.arg(), Value::Date(date)])
+            .map(drop)
     }
 
     /// Original filename.
@@ -753,7 +944,10 @@ impl<'a> Photo<'a> {
     }
 
     pub fn albums(&self) -> Result<Vec<Album<'a>>> {
-        let ids = self.lib.run("photoAlbums", &[self.arg()])?.into_text_list()?;
+        let ids = self
+            .lib
+            .run("photoAlbums", &[self.arg()])?
+            .into_text_list()?;
         ids.iter().map(|id| self.lib.album(id)).collect()
     }
 
@@ -778,8 +972,14 @@ mod tests {
 
     #[test]
     fn uuid_suffixing() {
-        assert_eq!(uuid_to_id("ABC", SUFFIX_PHOTO), ("ABC".into(), "ABC/L0/001".into()));
-        assert_eq!(uuid_to_id("ABC/L0/040", SUFFIX_ALBUM), ("ABC".into(), "ABC/L0/040".into()));
+        assert_eq!(
+            uuid_to_id("ABC", SUFFIX_PHOTO),
+            ("ABC".into(), "ABC/L0/001".into())
+        );
+        assert_eq!(
+            uuid_to_id("ABC/L0/040", SUFFIX_ALBUM),
+            ("ABC".into(), "ABC/L0/040".into())
+        );
     }
 
     #[test]
@@ -795,7 +995,13 @@ mod tests {
     fn collision_names() {
         assert_eq!(unique_stem("IMG_1", &[]), "IMG_1");
         assert_eq!(unique_stem("IMG_1", &["img_1".into()]), "IMG_1 (1)");
-        assert_eq!(unique_stem("IMG_1", &["IMG_1".into(), "IMG_1 (1)".into(), "IMG_10".into()]), "IMG_1 (2)");
+        assert_eq!(
+            unique_stem(
+                "IMG_1",
+                &["IMG_1".into(), "IMG_1 (1)".into(), "IMG_10".into()]
+            ),
+            "IMG_1 (2)"
+        );
     }
 
     #[test]

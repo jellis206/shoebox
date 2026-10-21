@@ -36,8 +36,9 @@ album.add(&[photo])?;
 
 ## Caveats (inherited from Photos' AppleScript)
 
-- Photos runs ~1 photo/sec over AppleScript; `shoebox photos` with no filter
-  walks the whole library.
+- Each property read is a round trip to Photos. Photos serves several clients
+  at once, so multi-photo `show`, `set`, `export` and `album export` split
+  across `-j` worker processes (default 4); output stays in input order.
 - `album remove` and `album move` recreate the album (its uuid changes).
 - Only top-level folders can be deleted.
 - Importing a duplicate without `--skip-duplicate-check` blocks on a dialog.

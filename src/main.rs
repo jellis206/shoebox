@@ -1,5 +1,7 @@
+use std::ops::Range;
 use std::path::PathBuf;
-use std::process::ExitCode;
+use std::process::{Command, ExitCode, Stdio};
+use std::thread;
 
 use chrono::NaiveDateTime;
 use clap::{Parser, Subcommand};
@@ -15,6 +17,9 @@ const DATE_FMT: &str = "%Y-%m-%dT%H:%M:%S";
 #[derive(Parser)]
 #[command(version)]
 struct Cli {
+    /// Parallel shoebox processes for multi-photo show/set/export (Photos serves them concurrently)
+    #[arg(short, long, global = true, default_value_t = 4)]
+    jobs: usize,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -135,7 +140,12 @@ struct ExportArgs {
 
 impl From<&ExportArgs> for ExportOptions {
     fn from(a: &ExportArgs) -> Self {
-        ExportOptions { original: a.original, overwrite: a.overwrite, timeout: a.timeout, reveal_in_finder: a.reveal }
+        ExportOptions {
+            original: a.original,
+            overwrite: a.overwrite,
+            timeout: a.timeout,
+            reveal_in_finder: a.reveal,
+        }
     }
 }
 
@@ -143,9 +153,13 @@ impl From<&ExportArgs> for ExportOptions {
 #[derive(Subcommand)]
 enum AlbumCmd {
     /// Album details as JSON
-    Show { album: String },
+    Show {
+        album: String,
+    },
     /// Uuids of the photos in the album
-    Photos { album: String },
+    Photos {
+        album: String,
+    },
     /// Create an album (inside FOLDER path if given, creating folders as needed)
     Create {
         name: String,
@@ -153,8 +167,13 @@ enum AlbumCmd {
         folder: Option<String>,
     },
     /// Delete the album (its photos stay in the library)
-    Delete { album: String },
-    Rename { album: String, name: String },
+    Delete {
+        album: String,
+    },
+    Rename {
+        album: String,
+        name: String,
+    },
     /// Add library photos to the album
     Add {
         album: String,
@@ -168,7 +187,10 @@ enum AlbumCmd {
         uuids: Vec<String>,
     },
     /// Move the album to a folder path, or top level if omitted (recreates the album)
-    Move { album: String, folder: Option<String> },
+    Move {
+        album: String,
+        folder: Option<String>,
+    },
     /// Export every photo in the album
     Export {
         album: String,
@@ -176,20 +198,33 @@ enum AlbumCmd {
         opts: ExportArgs,
     },
     /// Reveal the album in Photos
-    Spotlight { album: String },
+    Spotlight {
+        album: String,
+    },
 }
 
 #[derive(Subcommand)]
 enum FolderCmd {
     /// Folder details as JSON
-    Show { path: String },
+    Show {
+        path: String,
+    },
     /// Create a folder path, like mkdir -p
-    Create { path: String },
+    Create {
+        path: String,
+    },
     /// Delete a top-level folder and everything in it
-    Delete { path: String },
-    Rename { path: String, name: String },
+    Delete {
+        path: String,
+    },
+    Rename {
+        path: String,
+        name: String,
+    },
     /// Reveal the folder in Photos
-    Spotlight { path: String },
+    Spotlight {
+        path: String,
+    },
 }
 
 fn main() -> ExitCode {
@@ -197,10 +232,12 @@ fn main() -> ExitCode {
     unsafe extern "C" {
         fn signal(signum: i32, handler: usize) -> usize;
     }
-    unsafe { signal(13 /* SIGPIPE */, 0 /* SIG_DFL */) };
+    unsafe {
+        signal(13 /* SIGPIPE */, 0 /* SIG_DFL */)
+    };
 
     let cli = Cli::parse();
-    match Photos::new().and_then(|lib| run(&lib, cli.cmd)) {
+    match Photos::new().and_then(|lib| run(&lib, cli.cmd, cli.jobs)) {
         Ok(code) => code,
         Err(e) => {
             eprintln!("shoebox: {e}");
@@ -209,7 +246,99 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(lib: &Photos, cmd: Cmd) -> Result<ExitCode> {
+const CHUNK_ENV: &str = "SHOEBOX_CHUNK";
+
+/// Contiguous slice `i` of `n` over `len` items.
+fn chunk_range(len: usize, i: usize, n: usize) -> Range<usize> {
+    let size = len.div_ceil(n);
+    (i * size).min(len)..((i + 1) * size).min(len)
+}
+
+/// In a worker spawned by `fan_out`, the chunk of `items` it owns; otherwise all of them.
+fn my_chunk(mut items: Vec<String>) -> Vec<String> {
+    let chunk = std::env::var(CHUNK_ENV).ok().and_then(|c| {
+        let (i, n) = c.split_once('/')?;
+        Some((i.parse().ok()?, n.parse().ok()?))
+    });
+    match chunk {
+        Some((i, n)) => {
+            let r = chunk_range(items.len(), i, n);
+            items.truncate(r.end);
+            items.split_off(r.start)
+        }
+        None => items,
+    }
+}
+
+fn is_worker() -> bool {
+    std::env::var_os(CHUNK_ENV).is_some()
+}
+
+/// Re-runs this exact command line as up to `jobs` workers, each taking a contiguous
+/// chunk of the `count` items via `my_chunk`, and relays their stdout in order.
+/// Returns the relayed lines, or None when the work is too small to split.
+fn fan_out(count: usize, jobs: usize) -> Result<Option<Vec<String>>> {
+    let n = jobs.min(count);
+    if n < 2 || is_worker() {
+        return Ok(None);
+    }
+    let exe = std::env::current_exe().map_err(|e| Error::new(format!("fan out: {e}")))?;
+    let workers = (0..n)
+        .map(|i| {
+            let child = Command::new(&exe)
+                .args(std::env::args_os().skip(1))
+                .env(CHUNK_ENV, format!("{i}/{n}"))
+                .stdout(Stdio::piped())
+                .spawn()
+                .map_err(|e| Error::new(format!("fan out: {e}")))?;
+            // drain each pipe on its own thread so no worker blocks on a full pipe
+            Ok(thread::spawn(move || child.wait_with_output()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut lines = vec![];
+    let mut failed = 0;
+    for worker in workers {
+        let out = worker
+            .join()
+            .expect("worker thread")
+            .map_err(|e| Error::new(format!("fan out: {e}")))?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        print!("{text}");
+        lines.extend(text.lines().map(str::to_owned));
+        failed += usize::from(!out.status.success());
+    }
+    if failed > 0 {
+        return Err(Error::new(format!("{failed} of {n} workers failed")));
+    }
+    Ok(Some(lines))
+}
+
+fn export_cmd(lib: &Photos, uuids: Vec<String>, args: &ExportArgs, jobs: usize) -> Result<()> {
+    let written: Vec<PathBuf> = match fan_out(uuids.len(), jobs)? {
+        Some(lines) => lines.into_iter().map(PathBuf::from).collect(),
+        None => {
+            let per_photo = ExportOptions {
+                reveal_in_finder: false,
+                ..ExportOptions::from(args)
+            };
+            let mut written = vec![];
+            for uuid in my_chunk(uuids) {
+                for path in lib.photo(&uuid)?.export(&args.to, &per_photo)? {
+                    println!("{}", path.display());
+                    written.push(path);
+                }
+            }
+            written
+        }
+    };
+    if args.reveal && !is_worker() && !written.is_empty() {
+        lib.reveal_in_finder(&written)?;
+    }
+    Ok(())
+}
+
+fn run(lib: &Photos, cmd: Cmd, jobs: usize) -> Result<ExitCode> {
     match cmd {
         Cmd::Info => {
             let running = lib.running()?;
@@ -228,14 +357,22 @@ fn run(lib: &Photos, cmd: Cmd) -> Result<ExitCode> {
         Cmd::Running => {
             let running = lib.running()?;
             println!("{running}");
-            return Ok(if running { ExitCode::SUCCESS } else { ExitCode::FAILURE });
+            return Ok(if running {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            });
         }
         Cmd::Activate => lib.activate()?,
         Cmd::Quit => lib.quit()?,
         Cmd::Hide => lib.hide()?,
         Cmd::Open { library, delay } => lib.open(&library, delay)?,
         Cmd::Selection => lib.selection()?.iter().for_each(|p| println!("{}", p.uuid)),
-        Cmd::Photos { search, range, favorites } => {
+        Cmd::Photos {
+            search,
+            range,
+            favorites,
+        } => {
             let ids = if let Some(text) = search {
                 lib.search(&text)?
             } else if let Some(range) = range {
@@ -244,23 +381,35 @@ fn run(lib: &Photos, cmd: Cmd) -> Result<ExitCode> {
             } else if favorites {
                 lib.favorites()?.photo_ids()?
             } else {
-                for photo in lib.all_photos()? {
-                    println!("{}", photo?.uuid);
-                }
-                return Ok(ExitCode::SUCCESS);
+                lib.all_photo_ids()?
             };
-            ids.iter().for_each(|id| println!("{}", shoebox::uuid_to_id(id, "").0));
+            ids.iter()
+                .for_each(|id| println!("{}", shoebox::uuid_to_id(id, "").0));
         }
         Cmd::Show { uuids } => {
-            for uuid in uuids {
+            if fan_out(uuids.len(), jobs)?.is_some() {
+                return Ok(ExitCode::SUCCESS);
+            }
+            for uuid in my_chunk(uuids) {
                 println!("{}", photo_json(&lib.photo(&uuid)?)?);
             }
         }
-        Cmd::Set { uuids, title, description, keywords, favorite, location, date } => {
+        Cmd::Set {
+            uuids,
+            title,
+            description,
+            keywords,
+            favorite,
+            location,
+            date,
+        } => {
             let location = location.map(|l| parse_location(&l)).transpose()?;
             let date = date.map(|d| parse_date(&d)).transpose()?;
             let keywords = keywords.map(|k| split_list(&k));
-            for uuid in uuids {
+            if fan_out(uuids.len(), jobs)?.is_some() {
+                return Ok(ExitCode::SUCCESS);
+            }
+            for uuid in my_chunk(uuids) {
                 let photo = lib.photo(&uuid)?;
                 if let Some(t) = &title {
                     photo.set_title(t)?;
@@ -282,32 +431,27 @@ fn run(lib: &Photos, cmd: Cmd) -> Result<ExitCode> {
                 }
             }
         }
-        Cmd::Import { paths, album, skip_duplicate_check } => {
+        Cmd::Import {
+            paths,
+            album,
+            skip_duplicate_check,
+        } => {
             let album = album.map(|a| find_album(lib, &a)).transpose()?;
             for photo in lib.import(&paths, album.as_ref(), skip_duplicate_check)? {
                 println!("{}", photo.uuid);
             }
         }
-        Cmd::Export { uuids, opts: args } => {
-            let per_photo = ExportOptions { reveal_in_finder: false, ..ExportOptions::from(&args) };
-            let mut written = vec![];
-            for uuid in uuids {
-                for path in lib.photo(&uuid)?.export(&args.to, &per_photo)? {
-                    println!("{}", path.display());
-                    written.push(path);
-                }
-            }
-            if args.reveal && !written.is_empty() {
-                lib.reveal_in_finder(&written)?;
-            }
-        }
+        Cmd::Export { uuids, opts } => export_cmd(lib, uuids, &opts, jobs)?,
         Cmd::Duplicate { uuid } => println!("{}", lib.photo(&uuid)?.duplicate()?.uuid),
         Cmd::Albums { top_level } => {
             for album in lib.albums(top_level)? {
-                println!("{}", json!({ "uuid": album.uuid, "path": album.path_str('/')? }));
+                println!(
+                    "{}",
+                    json!({ "uuid": album.uuid, "path": album.path_str('/')? })
+                );
             }
         }
-        Cmd::Album(cmd) => album_cmd(lib, cmd)?,
+        Cmd::Album(cmd) => album_cmd(lib, cmd, jobs)?,
         Cmd::Folders { top_level } => {
             for folder in lib.folders(top_level)? {
                 println!("{}", folder.path_str('/')?);
@@ -319,7 +463,7 @@ fn run(lib: &Photos, cmd: Cmd) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn album_cmd(lib: &Photos, cmd: AlbumCmd) -> Result<()> {
+fn album_cmd(lib: &Photos, cmd: AlbumCmd, jobs: usize) -> Result<()> {
     match cmd {
         AlbumCmd::Show { album } => {
             let a = find_album(lib, &album)?;
@@ -348,12 +492,18 @@ fn album_cmd(lib: &Photos, cmd: AlbumCmd) -> Result<()> {
         AlbumCmd::Delete { album } => lib.delete_album(&find_album(lib, &album)?)?,
         AlbumCmd::Rename { album, name } => find_album(lib, &album)?.set_name(&name)?,
         AlbumCmd::Add { album, uuids } => {
-            let photos = uuids.iter().map(|u| lib.photo(u)).collect::<Result<Vec<Photo>>>()?;
+            let photos = uuids
+                .iter()
+                .map(|u| lib.photo(u))
+                .collect::<Result<Vec<Photo>>>()?;
             find_album(lib, &album)?.add(&photos)?;
         }
         AlbumCmd::Remove { album, uuids } => {
             let mut a = find_album(lib, &album)?;
-            let ids: Vec<String> = uuids.iter().map(|u| shoebox::uuid_to_id(u, "/L0/001").1).collect();
+            let ids: Vec<String> = uuids
+                .iter()
+                .map(|u| shoebox::uuid_to_id(u, "/L0/001").1)
+                .collect();
             a.remove_by_id(&ids)?;
             println!("{}", a.uuid);
         }
@@ -364,9 +514,8 @@ fn album_cmd(lib: &Photos, cmd: AlbumCmd) -> Result<()> {
             println!("{}", a.uuid);
         }
         AlbumCmd::Export { album, opts } => {
-            for path in find_album(lib, &album)?.export(&opts.to, &ExportOptions::from(&opts))? {
-                println!("{}", path.display());
-            }
+            let ids = find_album(lib, &album)?.photo_ids()?;
+            export_cmd(lib, ids, &opts, jobs)?;
         }
         AlbumCmd::Spotlight { album } => find_album(lib, &album)?.spotlight()?,
     }
@@ -377,8 +526,16 @@ fn folder_cmd(lib: &Photos, cmd: FolderCmd) -> Result<()> {
     match cmd {
         FolderCmd::Show { path } => {
             let f = find_folder(lib, &path)?;
-            let albums = f.albums()?.iter().map(Album::name).collect::<Result<Vec<_>>>()?;
-            let subfolders = f.subfolders()?.iter().map(Folder::name).collect::<Result<Vec<_>>>()?;
+            let albums = f
+                .albums()?
+                .iter()
+                .map(Album::name)
+                .collect::<Result<Vec<_>>>()?;
+            let subfolders = f
+                .subfolders()?
+                .iter()
+                .map(Folder::name)
+                .collect::<Result<Vec<_>>>()?;
             println!(
                 "{}",
                 json!({
@@ -390,7 +547,9 @@ fn folder_cmd(lib: &Photos, cmd: FolderCmd) -> Result<()> {
                 })
             );
         }
-        FolderCmd::Create { path } => println!("{}", lib.make_folders(&split_path(&path))?.path_str('/')?),
+        FolderCmd::Create { path } => {
+            println!("{}", lib.make_folders(&split_path(&path))?.path_str('/')?)
+        }
         FolderCmd::Delete { path } => lib.delete_folder(&find_folder(lib, &path)?)?,
         FolderCmd::Rename { path, name } => find_folder(lib, &path)?.set_name(&name)?,
         FolderCmd::Spotlight { path } => find_folder(lib, &path)?.spotlight()?,
@@ -425,24 +584,37 @@ fn find_album<'a>(lib: &'a Photos, name_or_uuid: &str) -> Result<Album<'a>> {
     if looks_like_uuid(name_or_uuid) {
         return lib.album(name_or_uuid);
     }
-    lib.album_by_name(name_or_uuid, false)?.ok_or_else(|| Error::new(format!("no album named {name_or_uuid:?}")))
+    lib.album_by_name(name_or_uuid, false)?
+        .ok_or_else(|| Error::new(format!("no album named {name_or_uuid:?}")))
 }
 
 fn find_folder<'a>(lib: &'a Photos, path: &str) -> Result<Folder<'a>> {
-    lib.folder_by_path(&split_path(path))?.ok_or_else(|| Error::new(format!("no folder at {path:?}")))
+    lib.folder_by_path(&split_path(path))?
+        .ok_or_else(|| Error::new(format!("no folder at {path:?}")))
 }
 
 // ponytail: folder names containing "/" can't be addressed from the CLI; the library API takes a Vec.
 fn split_path(path: &str) -> Vec<String> {
-    path.split('/').filter(|s| !s.is_empty()).map(str::to_owned).collect()
+    path.split('/')
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 fn split_list(s: &str) -> Vec<String> {
-    s.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned).collect()
+    s.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 fn parse_range(s: &str) -> Result<(i64, i64)> {
-    let num = |n: &str| n.trim().parse::<i64>().map_err(|_| Error::new(format!("bad range {s:?}: expected START:STOP or STOP")));
+    let num = |n: &str| {
+        n.trim()
+            .parse::<i64>()
+            .map_err(|_| Error::new(format!("bad range {s:?}: expected START:STOP or STOP")))
+    };
     match s.split_once(':') {
         Some((a, b)) => Ok((num(a)?, num(b)?)),
         None => Ok((0, num(s)?)),
@@ -455,11 +627,18 @@ fn parse_location(s: &str) -> Result<(Option<f64>, Option<f64>)> {
     }
     let bad = || Error::new(format!("bad location {s:?}: expected LAT,LON or none"));
     let (lat, lon) = s.split_once(',').ok_or_else(bad)?;
-    Ok((Some(lat.trim().parse().map_err(|_| bad())?), Some(lon.trim().parse().map_err(|_| bad())?)))
+    Ok((
+        Some(lat.trim().parse().map_err(|_| bad())?),
+        Some(lon.trim().parse().map_err(|_| bad())?),
+    ))
 }
 
 fn parse_date(s: &str) -> Result<NaiveDateTime> {
-    NaiveDateTime::parse_from_str(s, DATE_FMT).map_err(|e| Error::new(format!("bad date {s:?} ({e}): expected YYYY-MM-DDTHH:MM:SS")))
+    NaiveDateTime::parse_from_str(s, DATE_FMT).map_err(|e| {
+        Error::new(format!(
+            "bad date {s:?} ({e}): expected YYYY-MM-DDTHH:MM:SS"
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -476,8 +655,20 @@ mod tests {
         assert_eq!(parse_location("None").unwrap(), (None, None));
         assert_eq!(split_path("/Trips//2026/"), vec!["Trips", "2026"]);
         assert_eq!(split_list("a, b,,c"), vec!["a", "b", "c"]);
-        assert!(looks_like_uuid("EC19EA1A-FC91-449C-8925-B13D863E2EDB/L0/040"));
+        assert!(looks_like_uuid(
+            "EC19EA1A-FC91-449C-8925-B13D863E2EDB/L0/040"
+        ));
         assert!(!looks_like_uuid("Vacation"));
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn chunks_cover_everything_once_in_order() {
+        for len in 0..20 {
+            for n in 1..6 {
+                let all: Vec<usize> = (0..n).flat_map(|i| chunk_range(len, i, n)).collect();
+                assert_eq!(all, (0..len).collect::<Vec<_>>(), "len={len} n={n}");
+            }
+        }
     }
 }

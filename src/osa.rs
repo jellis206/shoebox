@@ -5,9 +5,9 @@ use std::fmt;
 
 use chrono::{NaiveDate, NaiveDateTime, TimeDelta};
 use objc2::AnyThread;
+use objc2::msg_send;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
-use objc2::msg_send;
 use objc2_foundation::{
     NSAppleEventDescriptor, NSAppleScript, NSAppleScriptErrorMessage, NSAppleScriptErrorNumber,
     NSData, NSDictionary, NSNumber, NSString,
@@ -70,22 +70,29 @@ impl std::error::Error for Error {}
 
 impl Error {
     pub fn new(message: impl Into<String>) -> Self {
-        Error { message: message.into(), number: None }
+        Error {
+            message: message.into(),
+            number: None,
+        }
     }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
 
 fn mac_epoch() -> NaiveDateTime {
-    NaiveDate::from_ymd_opt(1904, 1, 1).unwrap().and_hms_opt(0, 0, 0).unwrap()
+    NaiveDate::from_ymd_opt(1904, 1, 1)
+        .unwrap()
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
 }
 
 pub struct Script(Retained<NSAppleScript>);
 
 impl Script {
     pub fn compile(source: &str) -> Result<Self> {
-        let script = NSAppleScript::initWithSource(NSAppleScript::alloc(), &NSString::from_str(source))
-            .ok_or_else(|| Error::new("could not create NSAppleScript"))?;
+        let script =
+            NSAppleScript::initWithSource(NSAppleScript::alloc(), &NSString::from_str(source))
+                .ok_or_else(|| Error::new("could not create NSAppleScript"))?;
         let mut err = None;
         if !unsafe { script.compileAndReturnError(Some(&mut err)) } {
             return Err(error_from_info(err.as_deref()));
@@ -102,7 +109,10 @@ impl Script {
             -1, // kAutoGenerateReturnID
             0,  // kAnyTransactionID
         );
-        event.setParamDescriptor_forKeyword(&NSAppleEventDescriptor::descriptorWithString(&NSString::from_str(handler)), code(b"snam"));
+        event.setParamDescriptor_forKeyword(
+            &NSAppleEventDescriptor::descriptorWithString(&NSString::from_str(handler)),
+            code(b"snam"),
+        );
         event.setParamDescriptor_forKeyword(&pack(&Value::List(args.to_vec())), code(b"----"));
 
         let mut err: Option<Retained<NSDictionary<NSString, AnyObject>>> = None;
@@ -117,7 +127,9 @@ impl Script {
 }
 
 fn error_from_info(info: Option<&NSDictionary<NSString, AnyObject>>) -> Error {
-    let Some(info) = info else { return Error::new("unknown AppleScript error") };
+    let Some(info) = info else {
+        return Error::new("unknown AppleScript error");
+    };
     let message = info
         .objectForKey(unsafe { NSAppleScriptErrorMessage })
         .and_then(|o| o.downcast::<NSString>().ok())
@@ -142,8 +154,11 @@ fn pack(value: &Value) -> Retained<NSAppleEventDescriptor> {
         Value::Text(s) => NSAppleEventDescriptor::descriptorWithString(&NSString::from_str(s)),
         Value::Date(d) => {
             let secs = (*d - mac_epoch()).num_seconds();
-            NSAppleEventDescriptor::descriptorWithDescriptorType_data(TYPE_LDT, Some(&NSData::with_bytes(&secs.to_ne_bytes())))
-                .expect("long date descriptor")
+            NSAppleEventDescriptor::descriptorWithDescriptorType_data(
+                TYPE_LDT,
+                Some(&NSData::with_bytes(&secs.to_ne_bytes())),
+            )
+            .expect("long date descriptor")
         }
         Value::List(items) => {
             let list = NSAppleEventDescriptor::listDescriptor();
@@ -164,13 +179,21 @@ fn unpack(desc: &NSAppleEventDescriptor) -> Result<Value> {
         TYPE_SHORT | TYPE_LONG => Value::Int(desc.int32Value().into()),
         TYPE_COMP => Value::Int(i64::from_ne_bytes(eight_bytes(desc)?)),
         TYPE_DOUBLE | TYPE_SINGLE => Value::Float(desc.doubleValue()),
-        TYPE_UTXT | TYPE_UTF8 | TYPE_UT16 | TYPE_TEXT => {
-            Value::Text(desc.stringValue().map(|s| s.to_string()).unwrap_or_default())
+        TYPE_UTXT | TYPE_UTF8 | TYPE_UT16 | TYPE_TEXT => Value::Text(
+            desc.stringValue()
+                .map(|s| s.to_string())
+                .unwrap_or_default(),
+        ),
+        TYPE_LDT => {
+            Value::Date(mac_epoch() + TimeDelta::seconds(i64::from_ne_bytes(eight_bytes(desc)?)))
         }
-        TYPE_LDT => Value::Date(mac_epoch() + TimeDelta::seconds(i64::from_ne_bytes(eight_bytes(desc)?))),
         TYPE_LIST => Value::List(
             (1..=desc.numberOfItems())
-                .map(|i| desc.descriptorAtIndex(i).ok_or_else(|| Error::new("missing list item")).and_then(|d| unpack(&d)))
+                .map(|i| {
+                    desc.descriptorAtIndex(i)
+                        .ok_or_else(|| Error::new("missing list item"))
+                        .and_then(|d| unpack(&d))
+                })
                 .collect::<Result<_>>()?,
         ),
         other => {
@@ -183,7 +206,10 @@ fn unpack(desc: &NSAppleEventDescriptor) -> Result<Value> {
 }
 
 fn eight_bytes(desc: &NSAppleEventDescriptor) -> Result<[u8; 8]> {
-    desc.data().to_vec().try_into().map_err(|_| Error::new("malformed 8-byte descriptor"))
+    desc.data()
+        .to_vec()
+        .try_into()
+        .map_err(|_| Error::new("malformed 8-byte descriptor"))
 }
 
 impl Value {
