@@ -1,11 +1,14 @@
+use std::collections::{BTreeMap, HashSet};
 use std::ops::Range;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode, Stdio};
 use std::thread;
 
-use chrono::NaiveDateTime;
+use chrono::{Days, Local, NaiveDate, NaiveDateTime, NaiveTime};
 use clap::{Parser, Subcommand};
 use serde_json::{Value as Json, json};
+use shoebox::dupes::{self, Exact, Merge};
+use shoebox::library::{Asset, CORE_DATA_EPOCH, Library, REVIEW_PREFIX, SHOEBOX_FOLDER};
 use shoebox::{Album, Error, ExportOptions, Folder, Photo, Photos, Result};
 
 const DATE_FMT: &str = "%Y-%m-%dT%H:%M:%S";
@@ -117,6 +120,52 @@ enum Cmd {
     Folder(FolderCmd),
     /// Reveal a photo in Photos
     Spotlight { uuid: String },
+    /// Find duplicates and queue them into week-stamped albums in the Shoebox folder
+    ///
+    /// exact: byte-identical originals. The copy with the most on it survives (the
+    /// others' albums, keywords, favorite and title are merged onto it first); the rest
+    /// go to "Shoebox Delete <week>". near/similar: look-alike thumbnails among capture-time
+    /// neighbours; whole groups go to "Shoebox Review <week> #n" for you to choose.
+    /// Nothing is deleted: do that in Photos. Every run ends by removing empty Shoebox
+    /// albums from earlier weeks. Group JSON lines on stdout, a summary on stderr.
+    Dupes(DupesArgs),
+}
+
+#[derive(clap::Args)]
+struct DupesArgs {
+    #[arg(long = "match", value_enum, default_value_t = Match::Exact)]
+    mode: Match,
+    /// Max thumbnail difference in bits, 0-64 (near = 4, similar = 10)
+    #[arg(long)]
+    threshold: Option<u32>,
+    /// Capture-time neighbours compared on each side (near/similar)
+    #[arg(long, default_value_t = 20)]
+    window: usize,
+    /// Album name or uuid to clean; exact matches still look library-wide
+    #[arg(long, conflicts_with_all = ["from", "to"])]
+    album: Option<String>,
+    /// First capture date, YYYY-MM-DD
+    #[arg(long)]
+    from: Option<NaiveDate>,
+    /// Last capture date, YYYY-MM-DD (inclusive)
+    #[arg(long)]
+    to: Option<NaiveDate>,
+    /// Assets per review album; a group is never split
+    #[arg(long, default_value_t = 32)]
+    review_size: usize,
+    /// Print groups and the summary; change nothing in Photos
+    #[arg(long)]
+    dry_run: bool,
+    /// Photos library package
+    #[arg(long, default_value_os_t = Library::default_path())]
+    library: PathBuf,
+}
+
+#[derive(Clone, Copy, PartialEq, clap::ValueEnum)]
+enum Match {
+    Exact,
+    Near,
+    Similar,
 }
 
 #[derive(clap::Args)]
@@ -459,8 +508,243 @@ fn run(lib: &Photos, cmd: Cmd, jobs: usize) -> Result<ExitCode> {
         }
         Cmd::Folder(cmd) => folder_cmd(lib, cmd)?,
         Cmd::Spotlight { uuid } => lib.photo(&uuid)?.spotlight()?,
+        Cmd::Dupes(args) => dupes_cmd(lib, &args)?,
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn dupes_cmd(lib: &Photos, a: &DupesArgs) -> Result<()> {
+    let db = Library::new(&a.library);
+    let week = dupes::iso_week_label(Local::now().date_naive());
+
+    // Only what AppleScript can address, minus anything already queued by an earlier run.
+    let visible: HashSet<String> = lib
+        .all_photo_ids()?
+        .iter()
+        .map(|id| shoebox::uuid_to_id(id, "").0)
+        .collect();
+    let shoebox_albums = db.shoebox_albums()?;
+    let queued: HashSet<&str> = shoebox_albums.iter().map(|s| s.uuid.as_str()).collect();
+    let mut assets: Vec<Asset> = db
+        .assets()?
+        .into_iter()
+        .filter(|x| visible.contains(&x.uuid) && !x.albums.iter().any(|u| queued.contains(u.as_str())))
+        .collect();
+    assets.sort_by(|x, y| x.created.total_cmp(&y.created));
+
+    let members: Option<HashSet<String>> = match &a.album {
+        Some(album) => Some(db.album_members(album)?.into_iter().collect()),
+        None => None,
+    };
+    // ponytail: dates are UTC days; a few hours' skew at slice edges, which --window padding absorbs
+    let secs = |d: NaiveDate| (d.and_time(NaiveTime::MIN).and_utc().timestamp() - CORE_DATA_EPOCH) as f64;
+    let lo = a.from.map_or(f64::MIN, secs);
+    let hi = a.to.map_or(f64::MAX, |d| secs(d + Days::new(1)));
+    let in_scope = |x: &Asset| match &members {
+        Some(m) => m.contains(&x.uuid),
+        None => (lo..hi).contains(&x.created),
+    };
+
+    let mut groups = 0;
+    let mut skipped: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut planned: Vec<(String, Merge, Vec<String>)> = vec![];
+    let mut review: Vec<Vec<String>> = vec![];
+    let mut no_thumbnail = 0;
+    let uuids = |xs: &[&Asset]| xs.iter().map(|x| x.uuid.clone()).collect::<Vec<_>>();
+
+    if a.mode == Match::Exact {
+        for g in dupes::exact_groups(&assets) {
+            if !g.members().iter().any(|x| in_scope(x)) {
+                continue;
+            }
+            groups += 1;
+            match g {
+                Exact::Queue {
+                    survivor,
+                    losers,
+                    merge,
+                } => {
+                    println!(
+                        "{}",
+                        json!({
+                            "match": "exact",
+                            "survivor": survivor.uuid,
+                            "delete": uuids(&losers),
+                            "merge": (!merge.is_empty()).then(|| merge_json(&merge)),
+                        })
+                    );
+                    planned.push((survivor.uuid.clone(), merge, uuids(&losers)));
+                }
+                Exact::Skip { members, reason } => {
+                    println!(
+                        "{}",
+                        json!({ "match": "exact", "skipped": reason, "members": uuids(&members) })
+                    );
+                    *skipped.entry(reason).or_default() += 1;
+                }
+            }
+        }
+    } else {
+        let preset = if a.mode == Match::Near { 4 } else { 10 };
+        let max_dist = a.threshold.unwrap_or(preset);
+        // album scope compares album members; a date slice reads --window past each edge
+        let candidates: Vec<&Asset> = match &members {
+            Some(_) => assets.iter().filter(|x| in_scope(x)).collect(),
+            None => {
+                let first = assets.partition_point(|x| x.created < lo);
+                let last = assets.partition_point(|x| x.created < hi);
+                assets[first.saturating_sub(a.window)..(last + a.window).min(assets.len())]
+                    .iter()
+                    .collect()
+            }
+        };
+        let hashed = thumbnail_hashes(&db, &candidates);
+        no_thumbnail = candidates.len() - hashed.len();
+        for g in dupes::similar_groups(&hashed, a.window, max_dist) {
+            if !g.iter().any(|&i| in_scope(hashed[i].0)) {
+                continue;
+            }
+            groups += 1;
+            let members: Vec<String> = g.iter().map(|&i| hashed[i].0.uuid.clone()).collect();
+            let name = if a.mode == Match::Near { "near" } else { "similar" };
+            println!("{}", json!({ "match": name, "members": members }));
+            review.push(members);
+        }
+    }
+
+    let to_delete: usize = planned.iter().map(|p| p.2.len()).sum();
+    let to_review: usize = review.iter().map(Vec::len).sum();
+    let mut written = vec![];
+    if !a.dry_run && (!planned.is_empty() || !review.is_empty()) {
+        let folder = lib.make_folders(&[SHOEBOX_FOLDER.to_owned()])?;
+        let album_named = |name: &str| match folder.album(name)? {
+            Some(album) => Ok(album),
+            None => folder.create_album(name),
+        };
+
+        let mut losers = vec![];
+        for (survivor, merge, ls) in planned {
+            match apply_merge(lib, &survivor, &merge) {
+                Ok(()) => losers.extend(ls),
+                Err(e) => {
+                    eprintln!("shoebox: merging onto {survivor} failed, its copies stay put: {e}");
+                    *skipped.entry("merge-failed").or_default() += 1;
+                }
+            }
+        }
+        if !losers.is_empty() {
+            let name = dupes::delete_album_name(&week);
+            album_named(&name)?.add_uuids(&losers)?;
+            written.push(name);
+        }
+
+        let open = format!("{REVIEW_PREFIX}{week} #");
+        let last = shoebox_albums
+            .iter()
+            .filter_map(|s| Some((s.title.strip_prefix(&open)?.parse::<usize>().ok()?, s.members)))
+            .max();
+        let sizes: Vec<usize> = review.iter().map(Vec::len).collect();
+        let last_n = last.map_or(0, |l| l.0);
+        for (k, bucket) in dupes::pack_review(&sizes, a.review_size, last.map(|l| l.1))
+            .iter()
+            .enumerate()
+        {
+            if bucket.is_empty() {
+                continue;
+            }
+            let name = dupes::review_album_name(&week, last_n + k);
+            let assets: Vec<String> = bucket.iter().flat_map(|&g| review[g].clone()).collect();
+            album_named(&name)?.add_uuids(&assets)?;
+            written.push(name);
+        }
+    }
+
+    // Final cleanup: earlier weeks' Shoebox albums you've emptied.
+    let mut removed = vec![];
+    for s in &shoebox_albums {
+        if s.members == 0 && dupes::album_week(&s.title).is_some_and(|w| w != week) {
+            if !a.dry_run {
+                lib.delete_album(&lib.album(&s.uuid)?)?;
+            }
+            removed.push(s.title.clone());
+        }
+    }
+
+    eprintln!(
+        "{}",
+        json!({
+            "dry_run": a.dry_run,
+            "groups": groups,
+            "delete": to_delete,
+            "review": to_review,
+            "skipped": skipped,
+            "no_thumbnail": no_thumbnail,
+            "albums": written,
+            "removed_albums": removed,
+        })
+    );
+    Ok(())
+}
+
+/// dHash of each asset's thumbnail across all cores; assets without one are dropped.
+fn thumbnail_hashes<'a>(db: &Library, assets: &[&'a Asset]) -> Vec<(&'a Asset, u64)> {
+    let n = thread::available_parallelism().map_or(4, |n| n.get());
+    let size = assets.len().div_ceil(n).max(1);
+    let hashes: Vec<Option<u64>> = thread::scope(|s| {
+        let workers: Vec<_> = assets
+            .chunks(size)
+            .map(|chunk| {
+                s.spawn(move || {
+                    chunk
+                        .iter()
+                        .map(|x| db.thumbnail(&x.uuid).and_then(|p| dupes::dhash(&p).ok()))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|w| w.join().expect("hash worker"))
+            .collect()
+    });
+    assets
+        .iter()
+        .zip(hashes)
+        .filter_map(|(x, h)| Some((*x, h?)))
+        .collect()
+}
+
+fn apply_merge(lib: &Photos, survivor: &str, m: &Merge) -> Result<()> {
+    if m.is_empty() {
+        return Ok(());
+    }
+    let photo = lib.photo(survivor)?;
+    for album in &m.albums {
+        lib.album(album)?.add_uuids(&[survivor.to_owned()])?;
+    }
+    if let Some(k) = &m.keywords {
+        photo.set_keywords(k)?;
+    }
+    if m.favorite {
+        photo.set_favorite(true)?;
+    }
+    if let Some(t) = &m.title {
+        photo.set_title(t)?;
+    }
+    if let Some(d) = &m.description {
+        photo.set_description(d)?;
+    }
+    Ok(())
+}
+
+fn merge_json(m: &Merge) -> Json {
+    json!({
+        "albums": m.albums,
+        "keywords": m.keywords,
+        "favorite": m.favorite,
+        "title": m.title,
+        "description": m.description,
+    })
 }
 
 fn album_cmd(lib: &Photos, cmd: AlbumCmd, jobs: usize) -> Result<()> {
