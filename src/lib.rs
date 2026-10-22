@@ -2,6 +2,8 @@
 //! (https://github.com/RhetTbull/PhotoScript); the AppleScript handlers in
 //! `photoscript.applescript` are PhotoScript's, embedded verbatim.
 
+pub mod dupes;
+pub mod library;
 pub mod osa;
 
 use std::collections::HashMap;
@@ -627,6 +629,15 @@ impl<'a> Album<'a> {
             .run("albumAdd", &[self.arg(), ids.into()])?
             .into_text_list()?;
         added.iter().map(|id| self.lib.photo(id)).collect()
+    }
+
+    /// Adds photos by uuid in bulk, without the per-photo existence round trip `add` makes.
+    pub fn add_uuids(&self, uuids: &[String]) -> Result<()> {
+        let ids: Vec<String> = uuids.iter().map(|u| uuid_to_id(u, SUFFIX_PHOTO).1).collect();
+        for chunk in ids.chunks(200) {
+            self.lib.run("albumAdd", &[self.arg(), chunk.to_vec().into()])?;
+        }
+        Ok(())
     }
 
     pub fn import(&self, paths: &[PathBuf], skip_duplicate_check: bool) -> Result<Vec<Photo<'a>>> {
