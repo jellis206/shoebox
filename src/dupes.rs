@@ -46,6 +46,7 @@ pub struct Merge {
     pub favorite: bool,
     pub title: Option<String>,
     pub description: Option<String>,
+    pub location: Option<(f64, f64)>,
 }
 
 impl Merge {
@@ -105,18 +106,11 @@ fn judge(members: Vec<&Asset>) -> Exact<'_> {
     if edits.len() > 1 {
         return skip("different-edits");
     }
-    let (lo, hi) = members.iter().fold((f64::MAX, f64::MIN), |(lo, hi), a| {
-        (lo.min(a.created), hi.max(a.created))
-    });
-    if hi - lo > 1.0 {
-        return skip("different-date");
-    }
-    let same_place = |a: &Option<(f64, f64)>, b: &Option<(f64, f64)>| match (a, b) {
-        (None, None) => true,
-        (Some(a), Some(b)) => (a.0 - b.0).abs() < 1e-5 && (a.1 - b.1).abs() < 1e-5,
-        _ => false,
-    };
-    if !members.iter().all(|a| same_place(&a.location, &members[0].location)) {
+    // Dates are ignored: the bytes match, and the survivor keeps its own date.
+    // A missing location is filled in from a copy; only two conflicting ones skip.
+    let same_place = |a: (f64, f64), b: (f64, f64)| (a.0 - b.0).abs() < 1e-5 && (a.1 - b.1).abs() < 1e-5;
+    let places: Vec<(f64, f64)> = members.iter().filter_map(|a| a.location).collect();
+    if places.iter().any(|&p| !same_place(p, places[0])) {
         return skip("different-location");
     }
 
@@ -164,6 +158,9 @@ fn judge(members: Vec<&Asset>) -> Exact<'_> {
     }
     if keywords.len() > survivor.keywords.len() {
         merge.keywords = Some(keywords);
+    }
+    if survivor.location.is_none() {
+        merge.location = places.first().copied();
     }
     Exact::Queue {
         survivor,
@@ -316,13 +313,22 @@ mod tests {
         b.edit = Some("e2".into());
         assert_eq!(skipped(&[a, b]), "different-edits");
 
-        let (a, mut b) = (asset("a"), asset("b"));
-        b.created = 60.0;
-        assert_eq!(skipped(&[a, b]), "different-date");
-
-        let (a, mut b) = (asset("a"), asset("b"));
+        let (mut a, mut b) = (asset("a"), asset("b"));
+        a.location = Some((3.0, 4.0));
         b.location = Some((1.0, 2.0));
         assert_eq!(skipped(&[a, b]), "different-location");
+
+        // different dates queue; a missing location is filled from the other copy
+        let (mut a, mut b) = (asset("a"), asset("b"));
+        a.favorite = true;
+        b.created = 60.0;
+        b.location = Some((1.0, 2.0));
+        let pair = [a, b];
+        let Exact::Queue { survivor, merge, .. } = &exact_groups(&pair)[0] else {
+            panic!("skipped")
+        };
+        assert_eq!(survivor.uuid, "a");
+        assert_eq!(merge.location, Some((1.0, 2.0)));
 
         let (mut a, mut b) = (asset("a"), asset("b"));
         a.favorite = true;

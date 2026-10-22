@@ -27,7 +27,9 @@ decoding.
   title/description/keywords present, number of albums it's in. Tie: oldest
   `ZADDEDDATE`.
 - Some differences between copies can't be merged through AppleScript: two
-  *different* edits, or differing date or location *(Claude's call)*. A group
+  *different* edits, or two conflicting locations. Dates are ignored (Jay's
+  call: the bytes match, and the survivor keeps its own date). A missing
+  location is filled in from a copy. A group
   with any of these is skipped and counted as `skipped-unmergeable`. If a merge
   step fails, that group's losers aren't queued.
 - Before the losers are queued, merge onto the survivor *(Claude's call)*:

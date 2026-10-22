@@ -33,8 +33,9 @@ onto it. The rest go to `Shoebox/Shoebox Delete <week>`, which you select-all an
 delete in Photos. Look-alikes (`near`, `similar`) go as whole groups to
 `Shoebox/Shoebox Review <week> #n` albums of about 32. Delete what you don't
 want, take the keepers out, and the next run removes the emptied albums from
-earlier weeks. Copies with different edits, dates or locations are skipped and
-counted rather than merged.
+earlier weeks. Dates don't matter (the survivor keeps its own) and a missing
+location is filled in from a copy. Copies with different edits or conflicting
+locations are skipped and counted rather than merged.
 
 It reads `Photos.sqlite` read-only (`--library` for a non-default library), so
 the terminal needs access to the library package. Grant it Full Disk Access if

@@ -734,6 +734,9 @@ fn apply_merge(lib: &Photos, survivor: &str, m: &Merge) -> Result<()> {
     if let Some(d) = &m.description {
         photo.set_description(d)?;
     }
+    if let Some((lat, lon)) = m.location {
+        photo.set_location(Some(lat), Some(lon))?;
+    }
     Ok(())
 }
 
@@ -744,6 +747,7 @@ fn merge_json(m: &Merge) -> Json {
         "favorite": m.favorite,
         "title": m.title,
         "description": m.description,
+        "location": m.location,
     })
 }
 
